@@ -79,6 +79,16 @@ def train_epoch(epoch, wandb):
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
+            if writer is not None and (not ddp or dist.get_rank() == 0):
+                global_step = epoch * iter_per_epoch + step
+                writer.add_scalar("Loss/train", loss.item() * args.accumulation_steps, global_step)
+                writer.add_scalar("LearningRate", optimizer.param_groups[-1]['lr'], global_step)
+                writer.add_scalar("EpochTime/min", spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60, global_step)
+
+            # # 结束部分
+            # if writer is not None:
+            #     writer.close()
+
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
@@ -124,6 +134,7 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--use_tensorboard", type=bool, default=True)
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Pretrain")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
@@ -172,6 +183,13 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
+    # 初始化部分
+    if args.use_tensorboard and (not ddp or ddp_local_rank == 0):
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=args.tensorboard_log_dir)
+    else:
+        writer = None
+
 
     model, tokenizer = init_model(lm_config)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
