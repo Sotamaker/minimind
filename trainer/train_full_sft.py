@@ -30,7 +30,7 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def train_epoch(epoch, wandb):
+def train_epoch(epoch, wandb, writer):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
@@ -79,11 +79,18 @@ def train_epoch(epoch, wandb):
                 wandb.log({"loss": loss * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
+                
+            if writer is not None and (not ddp or dist.get_rank() == 0):
+                global_step = epoch * iter_per_epoch + step
+                writer.add_scalar("Loss/train", loss.item() * args.accumulation_steps, global_step)
+                writer.add_scalar("LearningRate", optimizer.param_groups[-1]['lr'], global_step)
+                writer.add_scalar("EpochTime/min", spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60, global_step)
+
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
+            ckp = f'{args.savemodel_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
@@ -92,18 +99,31 @@ def train_epoch(epoch, wandb):
             torch.save(state_dict, ckp)
             model.train()
 
-
 def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('../model')
-    model = MiniMindForCausalLM(lm_config)
+    candidate_paths = ['../model/', './model/']
+
+    for path in candidate_paths:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            print(f"成功从 {path} 加载 tokenizer")
+            break
+        except Exception as e:
+            print(f"从 {path} 加载 tokenizer 失败：{e}")
+    else:
+        raise RuntimeError("所有候选路径都无法加载 tokenizer，请检查模型文件是否存在。")
+    model = MiniMindForCausalLM(lm_config).to(args.device)
     moe_path = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
+    ckp = f'{args.pre_model_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
     model.load_state_dict(state_dict, strict=False)
 
+    
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     model = model.to(args.device)
     return model, tokenizer
+
+
+
 
 
 def init_distributed_mode():
@@ -121,10 +141,13 @@ def init_distributed_mode():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")
     parser.add_argument("--out_dir", type=str, default="../out")
+    parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl")
+    # parser.add_argument("--data_path", type=str, default="./dataset/sft_mini_512.jsonl")
+    # parser.add_argument("--out_dir", type=str, default="./out") # 如果debug 用这一行，命令行运行用上一行，因为主路径不一样
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--learning_rate", type=float, default=5e-7)
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda:6" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT")
@@ -140,20 +163,27 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int)
     parser.add_argument('--max_seq_len', default=512, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl")
+    parser.add_argument('--use_tensorboard', default=True, type=bool)
+    parser.add_argument("--pre_model_dir", type=str, default="../out/MiniMind-Pretrain/Epoch-6-BatchSize-32-LearningRate-0.0005/2025_06_20T22_24_58/model")
+    
 
     args = parser.parse_args()
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                use_moe=args.use_moe)
-    args.save_dir = os.path.join(args.out_dir)
+    if args.use_moe:
+        args.save_dir = os.path.join(args.out_dir,args.wandb_project,f"Moe-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}",time.strftime("%Y_%m_%dT%H_%M_%S", time.localtime()))
+    else:
+        args.save_dir = os.path.join(args.out_dir,args.wandb_project,f"Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}",time.strftime("%Y_%m_%dT%H_%M_%S", time.localtime()))
+    args.savemodel_dir = os.path.join(args.save_dir,'model')
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.savemodel_dir,exist_ok=True)
     tokens_per_iter = args.batch_size * args.max_seq_len
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
     args.wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-
+    args.tensorboard_log_dir = os.path.join(args.save_dir,'log') 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
     ddp_local_rank, DEVICE = 0, "cuda:0"
@@ -175,6 +205,13 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
+    
+    # 初始化部分
+    if args.use_tensorboard and (not ddp or ddp_local_rank == 0):
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=args.tensorboard_log_dir)
+    else:
+        writer = None
 
     model, tokenizer = init_model(lm_config)
 
@@ -199,4 +236,4 @@ if __name__ == "__main__":
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
-        train_epoch(epoch, wandb)
+        train_epoch(epoch, wandb, writer)

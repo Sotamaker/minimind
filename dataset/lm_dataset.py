@@ -95,7 +95,7 @@ class SFTDataset(Dataset):
                         break
                     end += 1
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
-                    loss_mask[j] = 1
+                    loss_mask[j] = 1 # 这里之所以要start+1是因为 每次后面还会跟一个换行符号 这里换行符号我们也是不需要学习的,len(self.eos_id) + 1 只需要学到<|im_end|>即可，后面的\n不需要了，所以这里只+1
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1

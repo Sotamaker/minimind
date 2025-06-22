@@ -45,7 +45,7 @@ def distillation_loss_fn(student_logits, teacher_logits, temperature=1.0, reduct
     return (temperature ** 2) * kl
 
 
-def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
+def train_epoch(epoch, wandb, writer ,alpha=0.0, temperature=1.0):
     start_time = time.time()
 
     if teacher_model is not None:
@@ -147,7 +147,17 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
 
 
 def init_student_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('../model/')
+    candidate_paths = ['../model/', './model/']
+
+    for path in candidate_paths:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            print(f"成功从 {path} 加载 tokenizer")
+            break
+        except Exception as e:
+            print(f"从 {path} 加载 tokenizer 失败：{e}")
+    else:
+        raise RuntimeError("所有候选路径都无法加载 tokenizer，请检查模型文件是否存在。")
     model = MiniMindForCausalLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
@@ -162,7 +172,7 @@ def init_student_model(lm_config):
 def init_teacher_model(lm_config):
     model = MiniMindForCausalLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
+    ckp = f'{args.pre_model_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
     state_dict = torch.load(ckp, map_location=args.device)
     model.load_state_dict(state_dict, strict=False)
     Logger(f'教师模型(LLM)总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
@@ -183,15 +193,23 @@ def init_distributed_mode():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind Full SFT")
-    parser.add_argument("--out_dir", type=str, default="../out")
+    parser = argparse.ArgumentParser(description="MiniMind Dist Full SFT")
+    # parser.add_argument("--out_dir", type=str, default="../out")
+    # parser.add_argument("--data_path", type=str, default="../dataset/sft_512.jsonl")
+    # parser.add_argument("--pre_model_dir", type=str, default="../out/MiniMind-Pretrain/Epoch-6-BatchSize-32-LearningRate-0.0005/2025_06_20T22_24_58/model")
+
+    parser.add_argument("--out_dir", type=str, default="./out")
+    parser.add_argument("--data_path", type=str, default="./dataset/sft_512.jsonl")
+    parser.add_argument("--pre_model_dir", type=str, default="./out/MiniMind-Pretrain/Epoch-6-BatchSize-32-LearningRate-0.0005/2025_06_20T22_24_58/model")
+    parser.add_argument('--use_tensorboard', default=True, type=bool)
+    
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="MiniMind-Full-SFT")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-Dist-Full-SFT")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=1)
@@ -201,20 +219,26 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=100)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument('--local_rank', type=int, default=-1)
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_xxx.jsonl")
+    
 
     args = parser.parse_args()
     # 定义学生模型和教师模型
     lm_config_student = MiniMindConfig(hidden_size=512, num_hidden_layers=8)
     lm_config_teacher = MiniMindConfig(hidden_size=768, num_hidden_layers=16)
-    args.save_dir = os.path.join(args.out_dir)
+    if args.use_moe:
+        args.save_dir = os.path.join(args.out_dir,args.wandb_project,f"Moe-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}",time.strftime("%Y_%m_%dT%H_%M_%S", time.localtime()))
+    else:
+        args.save_dir = os.path.join(args.out_dir,args.wandb_project,f"Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}",time.strftime("%Y_%m_%dT%H_%M_%S", time.localtime()))
+    args.savemodel_dir = os.path.join(args.save_dir,'model')
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.savemodel_dir,exist_ok=True)
+
     tokens_per_iter = args.batch_size * args.max_seq_len
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
     args.wandb_run_name = f"MiniMind-Dist-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-
+    args.tensorboard_log_dir = os.path.join(args.save_dir,'log') 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
     ddp_local_rank, DEVICE = 0, "cuda:0"
@@ -236,6 +260,12 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=args.wandb_run_name)
     else:
         wandb = None
+    # 初始化部分
+    if args.use_tensorboard and (not ddp or ddp_local_rank == 0):
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=args.tensorboard_log_dir)
+    else:
+        writer = None
 
     # 初始化学生模型和教师模型
     model, tokenizer = init_student_model(lm_config_student)
@@ -262,4 +292,4 @@ if __name__ == "__main__":
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
-        train_epoch(epoch, wandb)
+        train_epoch(epoch, wandb, writer)

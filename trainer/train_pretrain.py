@@ -92,7 +92,7 @@ def train_epoch(epoch, wandb):
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
-            ckp = f'{args.save_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
+            ckp = f'{args.savemodel_dir}/pretrain_{lm_config.hidden_size}{moe_path}.pth'
 
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
@@ -105,7 +105,17 @@ def train_epoch(epoch, wandb):
 
 
 def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('../model/')
+    candidate_paths = ['../model/', './model/']
+
+    for path in candidate_paths:
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(path)
+            print(f"成功从 {path} 加载 tokenizer")
+            break
+        except Exception as e:
+            print(f"从 {path} 加载 tokenizer 失败：{e}")
+    else:
+        raise RuntimeError("所有候选路径都无法加载 tokenizer，请检查模型文件是否存在。")
     model = MiniMindForCausalLM(lm_config).to(args.device)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     return model, tokenizer
@@ -127,11 +137,15 @@ def init_distributed_mode():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
     parser.add_argument("--out_dir", type=str, default="../out")
+    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
+    # parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
+    # parser.add_argument("--out_dir", type=str, default="./out") # 如果debug 用这一行，命令行运行用上一行，因为主路径不一样
+    
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
-    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--learning_rate", type=float, default=5e-4)
-    parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default="cuda:7" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--use_tensorboard", type=bool, default=True)
@@ -148,18 +162,24 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int)
     parser.add_argument('--max_seq_len', default=512, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
+    
     args = parser.parse_args()
 
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=args.use_moe)
-    args.save_dir = os.path.join(args.out_dir)
+    #args.save_dir = os.path.join(args.out_dir)
+    if args.use_moe:
+        args.save_dir = os.path.join(args.out_dir,args.wandb_project,f"Moe-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}",time.strftime("%Y_%m_%dT%H_%M_%S", time.localtime()))
+    else:
+        args.save_dir = os.path.join(args.out_dir,args.wandb_project,f"Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}",time.strftime("%Y_%m_%dT%H_%M_%S", time.localtime()))
+    args.savemodel_dir = os.path.join(args.save_dir,'model')
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
+    os.makedirs(args.savemodel_dir,exist_ok=True)
     tokens_per_iter = args.batch_size * args.max_seq_len
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
     args.wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
-
+    args.tensorboard_log_dir = os.path.join(args.save_dir,'log') 
     ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
 
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?

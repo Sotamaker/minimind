@@ -1,0 +1,1 @@
+python train_dpo.py --num_hidden_layers 8 --hidden_size 640 --use_moe true --pre_model_dir  ../out/MiniMind-Full-SFT/Moe-Epoch-2-BatchSize-16-LearningRate-5e-07/2025_06_22T08_32_51/model
